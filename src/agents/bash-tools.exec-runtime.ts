@@ -1,3 +1,4 @@
+import fs from "node:fs/promises";
 import path from "node:path";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import {
@@ -12,7 +13,7 @@ import { isDangerousHostInheritedEnvVarName } from "../infra/host-env-security.j
 import { findPathKey, mergePathPrepend } from "../infra/path-prepend.js";
 import { enqueueSystemEvent } from "../infra/system-events.js";
 import { scopedHeartbeatWakeOptions } from "../routing/session-key.js";
-import type { ProcessSession } from "./bash-process-registry.js";
+import type { ClosureKind, ProcessSession } from "./bash-process-registry.js";
 import type { ExecToolDetails } from "./bash-tools.exec-types.js";
 import type { BashSandboxConfig } from "./bash-tools.shared.js";
 export { applyPathPrepend, findPathKey, normalizePathPrepend } from "../infra/path-prepend.js";
@@ -131,9 +132,14 @@ export type ExecProcessFailureKind =
   | "no-output-timeout"
   | "signal"
   | "aborted"
-  | "runtime-error";
+  | "runtime-error"
+  | "artifact-missing"
+  | "artifact-wrong-tree";
 
-type ExecExitFailureKind = Exclude<ExecProcessFailureKind, "runtime-error">;
+type ExecExitFailureKind = Exclude<
+  ExecProcessFailureKind,
+  "runtime-error" | "artifact-missing" | "artifact-wrong-tree"
+>;
 
 export type ExecProcessOutcome =
   | {
@@ -492,6 +498,191 @@ export function buildExecRuntimeErrorOutcome(params: {
   };
 }
 
+/**
+ * Opt-in post-exit artifact gate for workflow-aware exec callers.
+ *
+ * When present on {@link runExecProcess} options, the runtime verifies that
+ * every path in `requiredArtifacts` exists under `workspaceRoot` *after* the
+ * child process exits and *before* the session is marked completed. If any
+ * required artifact is absent, the run is downgraded from lifecycle-only
+ * success to a workflow failure, and wrong-tree materialization (the same
+ * relative path resolved under any of `wrongTreeRoots`) is reported
+ * separately so callers can distinguish "nothing produced" from "produced
+ * under the wrong workspace".
+ *
+ * Generic exec runs (callers that omit this field) retain their existing
+ * lifecycle-only behavior.
+ */
+export type WorkflowArtifactContract = {
+  /**
+   * Required artifact paths. May be absolute or relative to `workspaceRoot`.
+   * Each resolved path MUST live inside `workspaceRoot`; any path that
+   * escapes is treated as a configuration error and fails verification.
+   */
+  requiredArtifacts: string[];
+  /**
+   * Optional sibling roots that should NOT contain the artifacts. When a
+   * required artifact is missing under `workspaceRoot` but the same relative
+   * path is present under any of these roots, the failure is classified as
+   * `artifact-wrong-tree` instead of `artifact-missing`.
+   */
+  wrongTreeRoots?: string[];
+  /** Absolute path that `requiredArtifacts` are resolved against. */
+  workspaceRoot: string;
+};
+
+export type ArtifactVerificationResult =
+  | { ok: true }
+  | {
+      ok: false;
+      kind: "artifact-missing" | "artifact-wrong-tree";
+      missing: string[];
+      wrongTreeMatches: Array<{ expectedPath: string; foundAt: string }>;
+    };
+
+async function pathExists(target: string): Promise<boolean> {
+  try {
+    await fs.stat(target);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveWithinRoot(root: string, rel: string): string | null {
+  const absRoot = path.resolve(root);
+  const candidate = path.resolve(absRoot, rel);
+  const normalizedRoot = absRoot.endsWith(path.sep) ? absRoot : `${absRoot}${path.sep}`;
+  if (candidate !== absRoot && !candidate.startsWith(normalizedRoot)) {
+    return null;
+  }
+  return candidate;
+}
+
+/**
+ * Why: the exec caller needs to know not just "did something get written"
+ * but "did the canonical workspace get the artifacts, or did the run write
+ * into a sibling tree by mistake". We check the canonical location first;
+ * if anything is missing there, and wrong-tree roots were supplied, we
+ * probe those siblings for the same relative paths and surface them
+ * explicitly so the caller can route recovery instead of retrying blind.
+ */
+export async function verifyWorkflowArtifacts(
+  contract: WorkflowArtifactContract,
+): Promise<ArtifactVerificationResult> {
+  const workspaceRoot = path.resolve(contract.workspaceRoot);
+  const normalizedRoot = workspaceRoot.endsWith(path.sep)
+    ? workspaceRoot
+    : `${workspaceRoot}${path.sep}`;
+  const missing: string[] = [];
+  // Missing artifacts whose relative path we will probe under wrong-tree
+  // roots, so we can distinguish "never produced" from "produced in the
+  // wrong workspace".
+  const missingProbes: Array<{ expected: string; rel: string }> = [];
+
+  for (const entry of contract.requiredArtifacts) {
+    const resolved = path.isAbsolute(entry)
+      ? path.resolve(entry)
+      : resolveWithinRoot(workspaceRoot, entry);
+    if (!resolved) {
+      missing.push(path.resolve(workspaceRoot, entry));
+      continue;
+    }
+    if (resolved !== workspaceRoot && !resolved.startsWith(normalizedRoot)) {
+      // Resolved path escapes workspaceRoot; treat as missing rather than
+      // silently accepting an out-of-tree path.
+      missing.push(resolved);
+      continue;
+    }
+    if (!(await pathExists(resolved))) {
+      missing.push(resolved);
+      missingProbes.push({ expected: resolved, rel: path.relative(workspaceRoot, resolved) });
+    }
+  }
+
+  if (missing.length === 0) {
+    return { ok: true };
+  }
+
+  const wrongTreeMatches: Array<{ expectedPath: string; foundAt: string }> = [];
+  const wrongTreeRoots = contract.wrongTreeRoots ?? [];
+  if (wrongTreeRoots.length > 0) {
+    for (const probe of missingProbes) {
+      for (const wrongRoot of wrongTreeRoots) {
+        const absWrong = path.resolve(wrongRoot);
+        if (absWrong === workspaceRoot) {
+          continue;
+        }
+        const candidate = resolveWithinRoot(absWrong, probe.rel);
+        if (!candidate) {
+          continue;
+        }
+        if (await pathExists(candidate)) {
+          wrongTreeMatches.push({ expectedPath: probe.expected, foundAt: candidate });
+          break;
+        }
+      }
+    }
+  }
+
+  return {
+    ok: false,
+    kind: wrongTreeMatches.length > 0 ? "artifact-wrong-tree" : "artifact-missing",
+    missing,
+    wrongTreeMatches,
+  };
+}
+
+function formatArtifactFailureReason(
+  verification: Extract<ArtifactVerificationResult, { ok: false }>,
+): string {
+  const lines: string[] = [];
+  if (verification.kind === "artifact-wrong-tree") {
+    lines.push(
+      "Workflow artifact verification failed: required artifacts were produced in the wrong tree.",
+    );
+    for (const match of verification.wrongTreeMatches) {
+      lines.push(`  expected: ${match.expectedPath}`);
+      lines.push(`  found at: ${match.foundAt}`);
+    }
+    const pureMissing = verification.missing.filter(
+      (m) => !verification.wrongTreeMatches.some((w) => w.expectedPath === m),
+    );
+    if (pureMissing.length > 0) {
+      lines.push("Additional required artifacts were not produced anywhere:");
+      for (const m of pureMissing) {
+        lines.push(`  missing: ${m}`);
+      }
+    }
+  } else {
+    lines.push("Workflow artifact verification failed: required artifacts were not produced.");
+    for (const m of verification.missing) {
+      lines.push(`  missing: ${m}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+export function buildExecArtifactFailureOutcome(params: {
+  verification: Extract<ArtifactVerificationResult, { ok: false }>;
+  aggregated: string;
+  durationMs: number;
+  exitCode: number | null;
+  exitSignal: NodeJS.Signals | number | null;
+}): ExecProcessOutcome {
+  const reason = formatArtifactFailureReason(params.verification);
+  return {
+    status: "failed",
+    exitCode: params.exitCode,
+    exitSignal: params.exitSignal,
+    durationMs: params.durationMs,
+    aggregated: params.aggregated,
+    timedOut: false,
+    failureKind: params.verification.kind,
+    reason: joinExecFailureOutput(params.aggregated, reason),
+  };
+}
+
 export async function runExecProcess(opts: {
   command: string;
   // Execute this instead of `command` (which is kept for display/session/logging).
@@ -511,6 +702,13 @@ export async function runExecProcess(opts: {
   sessionKey?: string;
   notifyDeliveryContext?: DeliveryContext;
   timeoutSec: number | null;
+  /**
+   * Opt-in workflow artifact gate. When provided, the run is only reported
+   * as completed if every entry in `requiredArtifacts` exists under
+   * `workspaceRoot` after the process exits. Omitting this field preserves
+   * legacy lifecycle-only behavior for generic exec callers.
+   */
+  workflowArtifacts?: WorkflowArtifactContract;
   onUpdate?: (partialResult: AgentToolResult<ExecToolDetails>) => void;
 }): Promise<ExecProcessHandle> {
   const startedAt = Date.now();
@@ -750,12 +948,24 @@ export async function runExecProcess(opts: {
           onStderr: handleStderr,
         });
       } catch (retryErr) {
-        markExited(session, null, null, "failed");
+        markExited(
+          session,
+          null,
+          null,
+          "failed",
+          opts.workflowArtifacts ? "lifecycle-only" : undefined,
+        );
         maybeNotifyOnExit(session, "failed");
         throw retryErr;
       }
     } else {
-      markExited(session, null, null, "failed");
+      markExited(
+        session,
+        null,
+        null,
+        "failed",
+        opts.workflowArtifacts ? "lifecycle-only" : undefined,
+      );
       maybeNotifyOnExit(session, "failed");
       throw err;
     }
@@ -772,14 +982,43 @@ export async function runExecProcess(opts: {
       updatesDisabled = true;
 
       const durationMs = Date.now() - startedAt;
-      const outcome = buildExecExitOutcome({
+      let outcome = buildExecExitOutcome({
         exit,
         aggregated: session.aggregated.trim(),
         durationMs,
         timeoutSec: opts.timeoutSec,
       });
 
-      markExited(session, exit.exitCode, exit.exitSignal, outcome.status);
+      // Workflow artifact gate: if the caller opted in and the process
+      // completed at lifecycle, verify required artifacts exist under the
+      // canonical workspace before persisting completion. Failed
+      // verification downgrades the outcome *before* markExited so the
+      // FinishedSession reflects truthful closure state.
+      let closureKind: ClosureKind | undefined;
+      if (opts.workflowArtifacts) {
+        if (outcome.status === "completed") {
+          const verification = await verifyWorkflowArtifacts(opts.workflowArtifacts);
+          if (verification.ok) {
+            closureKind = "artifact-verified";
+          } else {
+            outcome = buildExecArtifactFailureOutcome({
+              verification,
+              aggregated: session.aggregated.trim(),
+              durationMs,
+              exitCode: exit.exitCode ?? null,
+              exitSignal: exit.exitSignal,
+            });
+            closureKind = verification.kind;
+          }
+        } else {
+          // Process failed at lifecycle — workflow gate did not run, but
+          // persist the distinction so downstream readers can tell this was
+          // not an artifact-verified closure.
+          closureKind = "lifecycle-only";
+        }
+      }
+
+      markExited(session, exit.exitCode, exit.exitSignal, outcome.status, closureKind);
       maybeNotifyOnExit(session, outcome.status);
       if (!session.child && session.stdin) {
         session.stdin.destroyed = true;
@@ -796,7 +1035,13 @@ export async function runExecProcess(opts: {
     })
     .catch((err): ExecProcessOutcome => {
       updatesDisabled = true;
-      markExited(session, null, null, "failed");
+      markExited(
+        session,
+        null,
+        null,
+        "failed",
+        opts.workflowArtifacts ? "lifecycle-only" : undefined,
+      );
       maybeNotifyOnExit(session, "failed");
       return buildExecRuntimeErrorOutcome({
         error: err,

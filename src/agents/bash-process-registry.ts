@@ -18,6 +18,18 @@ let jobTtlMs = clampTtl(Number.parseInt(process.env.PI_BASH_JOB_TTL_MS ?? "", 10
 
 export type ProcessStatus = "running" | "completed" | "failed" | "killed";
 
+/**
+ * Why: lifecycle-only "completed" is insufficient evidence of a durable workflow
+ * outcome. Callers opting in to a post-exit artifact contract need to distinguish
+ * between runs closed purely on process lifecycle and runs whose canonical
+ * artifacts were actually observed (or observed in the wrong tree).
+ */
+export type ClosureKind =
+  | "lifecycle-only"
+  | "artifact-verified"
+  | "artifact-missing"
+  | "artifact-wrong-tree";
+
 export type SessionStdin = {
   write: (data: string, cb?: (err?: Error | null) => void) => void;
   end: () => void;
@@ -72,6 +84,11 @@ export interface FinishedSession {
   tail: string;
   truncated: boolean;
   totalOutputChars: number;
+  /**
+   * Set only when the exec caller opted into workflow artifact verification.
+   * Absent for generic exec runs, which continue to report on lifecycle alone.
+   */
+  closureKind?: ClosureKind;
 }
 
 const runningSessions = new Map<string, ProcessSession>();
@@ -150,19 +167,20 @@ export function markExited(
   exitCode: number | null,
   exitSignal: NodeJS.Signals | number | null,
   status: ProcessStatus,
+  closureKind?: ClosureKind,
 ) {
   session.exited = true;
   session.exitCode = exitCode;
   session.exitSignal = exitSignal;
   session.tail = tail(session.aggregated, 2000);
-  moveToFinished(session, status);
+  moveToFinished(session, status, closureKind);
 }
 
 export function markBackgrounded(session: ProcessSession) {
   session.backgrounded = true;
 }
 
-function moveToFinished(session: ProcessSession, status: ProcessStatus) {
+function moveToFinished(session: ProcessSession, status: ProcessStatus, closureKind?: ClosureKind) {
   runningSessions.delete(session.id);
 
   // Clean up child process stdio streams to prevent FD leaks
@@ -213,6 +231,7 @@ function moveToFinished(session: ProcessSession, status: ProcessStatus) {
     tail: session.tail,
     truncated: session.truncated,
     totalOutputChars: session.totalOutputChars,
+    closureKind,
   });
 }
 
